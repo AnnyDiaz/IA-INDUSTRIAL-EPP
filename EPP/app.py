@@ -6,10 +6,19 @@ import uuid
 import cv2
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
-from werkzeug.utils import secure_filename
+from werkzeug.utils import secure_filename 
 from transformers import pipeline
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+
+# Carga un modelo LLM ligero compatible con CPU
+tokenizer_llm = AutoTokenizer.from_pretrained("google/flan-t5-base")
+model_llm = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+
+historial_conversacion = []
 
 qa_model = pipeline("question-answering", model="deepset/roberta-base-squad2")
+
 
 
 app = Flask(__name__, template_folder='templates')
@@ -22,6 +31,48 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # Carga modelo YOLO para detección de EPP
 model = YOLO("ppe.pt")
 print("Etiquetas detectables:", model.names)
+
+def construir_contexto_epp():
+    contexto = "Información de elementos de protección personal:\n"
+    for clave, info in EPP_DEFINICION.items():
+        estado = "Detectado" if clave in ultima_deteccion else "No Detectado"
+        contexto += (
+            f"- {info['nombre']} ({estado}): {info.get('descripcion', 'Sin descripción')} "
+            f"Norma: {info.get('normativa', 'N/A')}\n"
+        )
+    
+    contexto += (
+        "\nRequisitos de cumplimiento:\n"
+        f"- Elementos requeridos: {', '.join([EPP_DEFINICION[k]['nombre'] for k in EPP_REQUERIDOS])}\n"
+        f"- Se considera cumplimiento si todos los elementos anteriores son detectados.\n"
+    )
+    return contexto
+
+
+def generar_respuesta_llm(pregunta, contexto_extra=""):
+    prompt = (
+        "Eres un asistente experto en seguridad industrial y uso de equipos de protección personal (EPP). "
+        "Responde de forma clara, precisa y concreta las preguntas basándote en el siguiente contexto:\n\n"
+        f"{contexto_extra}\n\n"
+        f"Pregunta: {pregunta}\n"
+        "Respuesta:"
+    )
+    
+    inputs = tokenizer_llm(prompt, return_tensors="pt", max_length=512, truncation=True)
+    outputs = model_llm.generate(
+        **inputs,
+        max_new_tokens=100,
+        temperature=0.7,      # Controla la creatividad (0.7 es un buen punto medio)
+        num_beams=4,          # Búsqueda en haz para mejor coherencia
+        no_repeat_ngram_size=2, # Evita repeticiones
+        early_stopping=True
+    )
+    respuesta = tokenizer_llm.decode(outputs[0], skip_special_tokens=True)
+    # Normalmente el modelo puede repetir el prompt, recortamos para quedarnos solo con la respuesta:
+    respuesta = respuesta.split("Respuesta:")[-1].strip()
+    return respuesta
+
+
 
 # Mapeo de etiquetas a nombres legibles y requisitos normativos
 
@@ -38,10 +89,10 @@ EPP_DEFINICION = {
        "descripcion": "Visibilidad en áreas con movimiento de vehículos"
     },
     #"Gloves": {
-     #   "nombre": "Guantes de seguridad",
-      #  "normativa": "Norma OSHA 1910.138",
-      #  "descripcion": "Protección de manos contra riesgos mecánicos o químicos"
-   # },
+        #"nombre": "Guantes de seguridad",
+        #"normativa": "Norma OSHA 1910.138",
+        #"descripcion": "Protección de manos contra riesgos mecánicos o químicos"
+    #},
     "Mask": {
         "nombre": "Mascarilla de protección",
         "normativa": "Norma NIOSH / OSHA 1910.134",
@@ -113,30 +164,56 @@ def analizar_imagen(imagen_path):
         print(f"Error en análisis de imagen: {str(e)}")
         return None, None
 
+
 def generar_respuesta_chat(pregunta):
     if not ultima_deteccion:
         return "Primero debes subir una imagen para analizar el equipo de protección."
 
     pregunta = pregunta.lower()
 
-    # Diccionario de sinónimos y sus claves de detección
+    # Diccionario de sinónimos
     sinonimos_epp = {
         "Hardhat": ["casco", "helmet", "sombrero duro"],
         "Safety Vest": ["chaleco", "chaleco reflectante", "safety vest", "chaleco de seguridad"],
-        "Glasses": ["gafas", "lentes", "anteojos", "protección ocular"],
         "Mask": ["tapabocas", "mascarilla", "cubrebocas", "barbijo", "nasobuco"],
-        "Gloves": ["guantes", "protección de manos", "protección manual", "glove", "manoplas"],
-        "Person": ["personas", "individuo", "hombre", "mujer", "humano"]
+        "Person": ["persona", "individuo", "hombre", "mujer", "humano"]
     }
 
     detectados = [EPP_DEFINICION[e]["nombre"].lower() for e in ultima_deteccion if e in EPP_DEFINICION]
     faltantes = [EPP_DEFINICION[e]["nombre"].lower() for e in EPP_REQUERIDOS if e not in ultima_deteccion]
 
-    # Verificación si hay persona sin EPP completo
-    if "Person" in ultima_deteccion and any(epp not in ultima_deteccion for epp in EPP_REQUERIDOS):
-        return "Se ha detectado una persona que no cumple con los elementos de protección personal requeridos según la normativa de seguridad industrial."
+    # 🔍 NUEVO: Preguntas explicativas o normativas → enviar al LLM
+    if any(p in pregunta for p in [
+        "por qué", "para qué", "qué pasa", "qué sucede", "qué dice la normativa", 
+        "sanción", "sanciones", "importancia", "riesgo", "sirve", "norma", "regla", "ley"
+    ]):
+        contexto = construir_contexto_epp()
+        return generar_respuesta_llm(pregunta, contexto_extra=contexto)
+    
+        # 🔍 Preguntas sobre incumplimiento normativo
+    if any(p in pregunta for p in [
+        "incumple", "incumplimiento", "está incumpliendo", 
+        "falta alguna norma", "rompe alguna norma", "infracción", "infracciones", 
+        "viola alguna norma", "está violando"
+    ]):
+        if not ultima_deteccion:
+            return "No se puede determinar el incumplimiento sin analizar una imagen primero."
+        
+        faltantes = [e for e in EPP_REQUERIDOS if e not in ultima_deteccion]
+        if not faltantes:
+            return "No, el trabajador cumple con todas las normativas de protección personal requeridas."
+        
+        normas_incumplidas = [
+            f"{EPP_DEFINICION[e]['nombre']}: {EPP_DEFINICION[e]['normativa']}"
+            for e in faltantes
+        ]
+        return (
+            "Sí, el trabajador está incumpliendo normativas de seguridad. Elementos faltantes:\n" +
+            "\n".join(normas_incumplidas)
+        )
 
-    # Revisión por EPP individual
+
+    # Respuestas específicas por EPP
     for clave, lista_sinonimos in sinonimos_epp.items():
         if any(p in pregunta for p in lista_sinonimos):
             if clave in ultima_deteccion:
@@ -144,32 +221,34 @@ def generar_respuesta_chat(pregunta):
             else:
                 return f"No, el trabajador no está usando {EPP_DEFINICION[clave]['nombre'].lower()}."
 
-    # Preguntas sobre cumplimiento
-    if any(p in pregunta for p in ["qué le falta", "faltan", "le falta algo", "le faltan"]):
-        if not faltantes:
-            return "No faltan elementos de protección. El trabajador cumple con todos los EPP requeridos."
-        else:
-            return "Faltan los siguientes elementos de protección: " + ", ".join(faltantes) + "."
-
+    # Cumplimiento
     if any(p in pregunta for p in ["cumple", "normativa", "reglamento", "seguridad"]):
         return "Sí, cumple con todos los EPP requeridos." if not faltantes else "No, no cumple con todos los EPP requeridos."
 
-    if any(p in pregunta for p in ["qué está usando", "qué tiene puesto", "qué lleva puesto", "qué protección tiene"]):
+    # Faltantes
+    if any(p in pregunta for p in ["qué le falta", "faltan", "le falta algo", "le faltan"]):
+        return "No faltan elementos de protección. El trabajador cumple con todos los EPP requeridos." if not faltantes else "Faltan los siguientes elementos: " + ", ".join(faltantes)
+
+    # ¿Qué lleva puesto?
+    if any(p in pregunta for p in ["qué está usando", "qué tiene puesto", "qué lleva puesto", "qué protección tiene", "qué tipo de protección"]):
         return "El trabajador está usando: " + ", ".join(detectados) + "."
 
-    # Respuesta general
+    # Si nada coincide, usar el LLM como respaldo
+    contexto = construir_contexto_epp()
+    return generar_respuesta_llm(pregunta, contexto_extra=contexto)
+
+def construir_contexto_epp():
     return (
-        "Puedo responder preguntas como: "
-        "'¿Está usando casco?', '¿Faltan elementos de seguridad?', "
-        "'¿Cumple con la normativa?', '¿Qué le falta?', entre otras."
+        "Los Equipos de Protección Personal (EPP) son obligatorios para garantizar la seguridad de los trabajadores en ambientes de riesgo. "
+        "Los principales EPP incluyen casco, chaleco reflectante y mascarilla.\n"
+        "- El casco protege contra golpes y objetos que caen desde altura.\n"
+        "- El chaleco mejora la visibilidad del trabajador, especialmente en zonas con maquinaria pesada.\n"
+        "- El tapabocas protege contra polvo, humo y partículas peligrosas.\n\n"
+        "El incumplimiento del uso de EPP puede conllevar sanciones laborales, multas o suspensión de trabajo, según normativas locales como OSHA y ANSI.\n"
+        "Es fundamental cumplir con estas normativas para garantizar la seguridad y evitar consecuencias legales y riesgos de accidentes."
     )
 
-
-    try:
-        respuesta = qa_model(question=pregunta, context=contexto)
-        return respuesta['answer']
-    except Exception as e:
-        return f"Error al responder: {str(e)}"
+   
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -191,7 +270,7 @@ def index():
                             "cumplimiento": cumplimiento,
                             "detectados": [e["nombre"] for e in informe["detectados"]],
                             "faltantes": [e["nombre"] for e in informe["faltantes"]],
-                            "normativas": [e["normativa"] for e in informe["faltantes"]],
+                            "normativas": [e.get["normativa"] for e in informe["faltantes"]],
                             "descripciones": [e["descripcion"] for e in informe["faltantes"]],
                             "imagen": img_resultado
                         }
