@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 9
+names: ['0', 'Boots', 'Ear-protection', 'Glass', 'Glove', 'Helmet', 'Mask', 'Person', 'Vest']
+
+roboflow:
+  workspace: deteccin-epp
+  project: poyect-ia
+  version: 4
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/deteccin-epp/poyect-ia/dataset/4
